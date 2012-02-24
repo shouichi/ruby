@@ -325,6 +325,9 @@ static int yylex(void*, void*);
 #ifndef RIPPER
 #define yyparse ruby_yyparse
 
+static NODE *node_for(struct parser_params*,NODE*,NODE*,NODE*,NODE*);
+#define rb_node_for(n1,n2,n3,n4) node_for(parser,(n1),(n2),(n3),(n4))
+
 static NODE* node_newnode(struct parser_params *, enum node_type, VALUE, VALUE, VALUE);
 #define rb_node_newnode(type, a1, a2, a3) node_newnode(parser, (type), (a1), (a2), (a3))
 
@@ -698,7 +701,7 @@ static void token_info_pop(struct parser_params*, const char *token);
 %type <node> command_asgn mrhs superclass block_call block_command
 %type <node> f_block_optarg f_block_opt
 %type <node> f_arglist f_args f_arg f_arg_item f_optarg f_marg f_marg_list f_margs
-%type <node> assoc_list assocs assoc undef_list backref string_dvar for_var
+%type <node> assoc_list assocs assoc undef_list backref string_dvar for_var guarded_loops
 %type <node> block_param opt_block_param block_param_def f_opt
 %type <node> f_kwarg f_kw f_block_kwarg f_block_kw
 %type <node> bv_decls opt_bv_decl bvar
@@ -2885,71 +2888,13 @@ primary		: literal
 			$$ = dispatch2(case, Qnil, $3);
 		    %*/
 		    }
-		| k_for for_var keyword_in
-		  {COND_PUSH(1);}
-		  expr_value do
-		  {COND_POP();}
-		  compstmt
+		| k_for
+		  guarded_loops
 		  k_end
 		    {
 		    /*%%%*/
-			/*
-			 *  for a, b, c in e
-			 *  #=>
-			 *  e.each{|*x| a, b, c = x
-			 *
-			 *  for a in e
-			 *  #=>
-			 *  e.each{|x| a, = x}
-			 */
-			ID id = internal_id();
-			ID *tbl = ALLOC_N(ID, 2);
-			NODE *m = NEW_ARGS_AUX(0, 0);
-			NODE *args, *scope;
-
-			if (nd_type($2) == NODE_MASGN) {
-			    /* if args.length == 1 && args[0].kind_of?(Array)
-			     *   args = args[0]
-			     * end
-			     */
-			    NODE *one = NEW_LIST(NEW_LIT(INT2FIX(1)));
-			    NODE *zero = NEW_LIST(NEW_LIT(INT2FIX(0)));
-			    m->nd_next = block_append(
-				NEW_IF(
-				    NEW_NODE(NODE_AND,
-					     NEW_CALL(NEW_CALL(NEW_DVAR(id), rb_intern("length"), 0),
-						      rb_intern("=="), one),
-					     NEW_CALL(NEW_CALL(NEW_DVAR(id), rb_intern("[]"), zero),
-						      rb_intern("kind_of?"), NEW_LIST(NEW_LIT(rb_cArray))),
-					     0),
-				    NEW_DASGN_CURR(id,
-						   NEW_CALL(NEW_DVAR(id), rb_intern("[]"), zero)),
-				    0),
-				node_assign($2, NEW_DVAR(id)));
-
-			    args = new_args(m, 0, id, 0, 0, 0, 0);
-			}
-			else {
-			    if (nd_type($2) == NODE_LASGN ||
-				nd_type($2) == NODE_DASGN ||
-				nd_type($2) == NODE_DASGN_CURR) {
-				$2->nd_value = NEW_DVAR(id);
-				m->nd_plen = 1;
-				m->nd_next = $2;
-				args = new_args(m, 0, 0, 0, 0, 0, 0);
-			    }
-			    else {
-				m->nd_next = node_assign(NEW_MASGN(NEW_LIST($2), 0), NEW_DVAR(id));
-				args = new_args(m, 0, id, 0, 0, 0, 0);
-			    }
-			}
-			scope = NEW_NODE(NODE_SCOPE, tbl, $8, args);
-			tbl[0] = 1; tbl[1] = id;
-			$$ = NEW_FOR(0, $5, scope);
-			fixpos($$, $2);
-		    /*%
-			$$ = dispatch3(for, $2, $5, $8);
-		    %*/
+			$$ = $2;
+		    /*% %*/
 		    }
 		| k_class cpath superclass
 		    {
@@ -4047,6 +3992,31 @@ case_body	: keyword_when args then
 cases		: opt_else
 		| case_body
 		;
+
+guarded_loops	: for_var keyword_in expr_value keyword_when expr_value term compstmt
+		    {
+		    /*%%%*/
+			$$ = rb_node_for($1, $3, $5, $7);
+		    /*% %*/
+		    }
+		| for_var keyword_in expr_value term compstmt
+		    {
+		    /*%%%*/
+			$$ = rb_node_for($1, $3, 0, $5);
+		    /*% %*/
+		    }
+		| for_var keyword_in expr_value keyword_when expr_value term guarded_loops
+		    {
+		    /*%%%*/
+			$$ = rb_node_for($1, $3, $5, $7);
+		    /*% %*/
+		    }
+		| for_var keyword_in expr_value term guarded_loops
+		    {
+		    /*%%%*/
+			$$ = rb_node_for($1, $3, 0, $5);
+		    /*% %*/
+		    }
 
 opt_rescue	: keyword_rescue exc_list exc_var then
 		  compstmt
@@ -8527,6 +8497,62 @@ yylex(void *p)
 #endif
 
     return t;
+}
+
+static NODE *
+node_for(struct parser_params *parser, NODE *for_var, NODE *array, NODE *condition, NODE *compstmt)
+{
+    ID id = internal_id();
+    ID *tbl = ALLOC_N(ID, 2);
+    NODE *m = NEW_ARGS_AUX(0, 0);
+    NODE *args, *scope, *node_for;
+
+    if (nd_type(for_var) == NODE_MASGN) {
+        /* if args.length == 1 && args[0].kind_of?(Array)
+         *   args = args[0]
+         * end
+         */
+	NODE *one = NEW_LIST(NEW_LIT(INT2FIX(1)));
+	NODE *zero = NEW_LIST(NEW_LIT(INT2FIX(0)));
+	m->nd_next = block_append(
+	NEW_IF(
+	    NEW_NODE(NODE_AND,
+		     NEW_CALL(NEW_CALL(NEW_DVAR(id), rb_intern("length"), 0),
+			      rb_intern("=="), one),
+		     NEW_CALL(NEW_CALL(NEW_DVAR(id), rb_intern("[]"), zero),
+			      rb_intern("kind_of?"), NEW_LIST(NEW_LIT(rb_cArray))),
+		     0),
+	    NEW_DASGN_CURR(id,
+			   NEW_CALL(NEW_DVAR(id), rb_intern("[]"), zero)),
+	    0),
+	node_assign(for_var, NEW_DVAR(id)));
+
+	args = new_args(m, 0, id, 0, 0, 0, 0);
+    }
+    else {
+	    if (nd_type(for_var) == NODE_LASGN ||
+	    nd_type(for_var) == NODE_DASGN ||
+	    nd_type(for_var) == NODE_DASGN_CURR) {
+		for_var->nd_value = NEW_DVAR(id);
+		m->nd_plen = 1;
+		m->nd_next = for_var;
+		args = new_args(m, 0, 0, 0, 0, 0, 0);
+        }
+        else {
+		m->nd_next = node_assign(NEW_MASGN(NEW_LIST(for_var), 0), NEW_DVAR(id));
+		args = new_args(m, 0, id, 0, 0, 0, 0);
+        }
+    }
+    if (condition == 0) {
+	scope = NEW_NODE(NODE_SCOPE, tbl, compstmt, args);
+    }
+    else {
+	scope = NEW_NODE(NODE_SCOPE, tbl, NEW_IF(cond(condition), compstmt, 0), args);
+    }
+    tbl[0] = 1; tbl[1] = id;
+    node_for = NEW_FOR(0, array, scope);
+    fixpos(node_for, for_var);
+    return node_for;
 }
 
 #ifndef RIPPER
